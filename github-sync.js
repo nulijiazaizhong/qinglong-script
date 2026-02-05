@@ -308,7 +308,8 @@ async function syncToCnbGit(owner, repo) {
     try { console.log('remote refs error', String(e && e.message ? e.message : e)); } catch (_) {}
   }
   try { console.log('exec', 'git push --mirror cnb'); } catch (_) {}
-  await runCmd('git', ['push', '--mirror', 'cnb'], TEMP_DIR);
+  await runCmd('git', ['push', 'cnb', '--all'], TEMP_DIR);  // 推送所有分支
+  await runCmd('git', ['push', 'cnb', '--tags'], TEMP_DIR); // 推送所有标签
   try { console.log('done', 'push mirror'); } catch (_) {}
   rimraf(TEMP_DIR);
 }
