@@ -53,7 +53,9 @@ const CNB_REMOTE_BRANCH = env('CNB_REMOTE_BRANCH', BRANCH);
 const CNB_REMOTE_USERNAME = env('CNB_REMOTE_USERNAME', '');
 const CNB_REMOTE_PASSWORD = env('CNB_REMOTE_PASSWORD', '');
 const CNB_REMOTE_TOKEN = env('CNB_REMOTE_TOKEN', '');
-const TEMP_DIR = env('TEMP_DIR', path.resolve(process.cwd(), '.cnb-sync-tmp'));
+const CNB_SYNC_PULL_REQUESTS = env('CNB_SYNC_PULL_REQUESTS', '0') === '1';
+const TEMP_DIR_BASE = env('TEMP_DIR', path.resolve(process.cwd(), '.cnb-sync-tmp'));
+const TEMP_DIR = TEMP_DIR_BASE + '-' + process.pid + '-' + Date.now().toString(36);
 const LOCAL_SOURCE_DIR = env('LOCAL_SOURCE_DIR', '');
 
 function parseRepo(s) {
@@ -282,9 +284,17 @@ async function syncToCnbGit(owner, repo) {
       console.log('mode', 'cnb');
       const gh = TOKEN ? withAuth('https://github.com/' + owner + '/' + repo + '.git', TOKEN, '', TOKEN) : ('https://github.com/' + owner + '/' + repo + '.git');
       const remote = withAuthCnb(CNB_REMOTE_URL, CNB_REMOTE_USERNAME, CNB_REMOTE_PASSWORD, CNB_REMOTE_TOKEN);
-      console.log('plan', 'git clone --mirror', maskUrlAuth(gh));
+      console.log('plan', 'git init --bare', TEMP_DIR);
+      console.log('plan', 'git remote add origin', maskUrlAuth(gh));
+      console.log('plan', 'git ls-remote origin refs/heads/' + BRANCH);
+      console.log('plan', 'git fetch --prune origin +refs/heads/*:refs/heads/* +refs/tags/*:refs/tags/*');
+      if (CNB_SYNC_PULL_REQUESTS) {
+        console.log('plan', 'git update-ref -d refs/heads/pr/* (best-effort)');
+        console.log('plan', 'git fetch --prune origin +refs/pull/*/head:refs/heads/pr/*');
+      }
       console.log('plan', 'git remote add cnb', maskUrlAuth(remote));
-      console.log('plan', 'git push --mirror cnb');
+      console.log('plan', 'git push cnb --prune --force --all');
+      console.log('plan', 'git push cnb --force --tags');
     } catch (_) {}
     return;
   }
@@ -294,11 +304,73 @@ async function syncToCnbGit(owner, repo) {
   let gh = 'https://github.com/' + owner + '/' + repo + '.git';
   if (TOKEN) gh = withAuth(gh, TOKEN, '', TOKEN);
   try { console.log('mode', 'cnb'); } catch (_) {}
-  try { console.log('exec', 'git clone --mirror', maskUrlAuth(gh), '->', TEMP_DIR); } catch (_) {}
-  await runCmd('git', ['clone', '--mirror', gh, TEMP_DIR], process.cwd());
+  try { console.log('exec', 'git init --bare', '->', TEMP_DIR); } catch (_) {}
+  await runCmd('git', ['init', '--bare'], TEMP_DIR);
+  try { fs.mkdirSync(path.join(TEMP_DIR, 'objects', 'pack'), { recursive: true }); } catch (_) {}
+  try { fs.mkdirSync(path.join(TEMP_DIR, 'objects', 'info'), { recursive: true }); } catch (_) {}
+  try { console.log('exec', 'git remote add origin', maskUrlAuth(gh)); } catch (_) {}
+  await runCmd('git', ['remote', 'add', 'origin', gh], TEMP_DIR);
+  async function readRemoteRefHash(repoDir, remoteName, ref) {
+    try {
+      const out = await runCmd('git', ['ls-remote', remoteName, ref], repoDir);
+      const line = String(out || '').trim().split(/\r?\n/).filter(Boolean)[0] || '';
+      return line.split(/\s+/)[0] || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  const branchRef = 'refs/heads/' + BRANCH;
+  const originBranchHashRemoteBeforeFetch = await readRemoteRefHash(TEMP_DIR, 'origin', branchRef);
+  if (DEBUG) {
+    try { console.log('debug', 'origin(remote)', branchRef, originBranchHashRemoteBeforeFetch || '(missing)'); } catch (_) {}
+  }
+  try { console.log('exec', 'git fetch --prune origin +refs/heads/*:refs/heads/* +refs/tags/*:refs/tags/*'); } catch (_) {}
+  await runCmd('git', ['fetch', '--prune', 'origin', '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*'], TEMP_DIR);
+  async function deleteLocalRefsByPrefix(repoDir, prefix) {
+    let out = '';
+    try {
+      out = await runCmd('git', ['for-each-ref', '--format=%(refname)', prefix], repoDir);
+    } catch (_) {
+      return 0;
+    }
+    const refs = String(out || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    let deleted = 0;
+    for (const ref of refs) {
+      try {
+        await runCmd('git', ['update-ref', '-d', ref], repoDir);
+        deleted++;
+      } catch (_) {}
+    }
+    return deleted;
+  }
+
+  if (CNB_SYNC_PULL_REQUESTS) {
+    const deletedPrRefs = await deleteLocalRefsByPrefix(TEMP_DIR, 'refs/heads/pr');
+    if (DEBUG && deletedPrRefs) {
+      try { console.log('debug', 'deleted refs/heads/pr/*', deletedPrRefs); } catch (_) {}
+    }
+    try { console.log('exec', 'git fetch --prune origin +refs/pull/*/head:refs/heads/pr/*'); } catch (_) {}
+    await runCmd('git', ['fetch', '--prune', 'origin', '+refs/pull/*/head:refs/heads/pr/*'], TEMP_DIR);
+  }
   const remote = withAuthCnb(CNB_REMOTE_URL, CNB_REMOTE_USERNAME, CNB_REMOTE_PASSWORD, CNB_REMOTE_TOKEN);
   try { console.log('exec', 'git remote add cnb', maskUrlAuth(remote)); } catch (_) {}
   await runCmd('git', ['remote', 'add', 'cnb', remote], TEMP_DIR);
+  async function readLocalRefHash(repoDir, ref) {
+    try {
+      const out = await runCmd('git', ['rev-parse', ref], repoDir);
+      return String(out || '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  const originBranchHash = await readLocalRefHash(TEMP_DIR, branchRef);
+  const cnbBranchHashBefore = await readRemoteRefHash(TEMP_DIR, 'cnb', branchRef);
+  if (DEBUG) {
+    try { console.log('debug', 'origin', branchRef, originBranchHash || '(missing)'); } catch (_) {}
+    try { console.log('debug', 'cnb(before)', branchRef, cnbBranchHashBefore || '(missing)'); } catch (_) {}
+  }
   try { console.log('exec', 'git ls-remote cnb'); } catch (_) {}
   try {
     const refs = await runCmd('git', ['ls-remote', 'cnb'], TEMP_DIR);
@@ -307,10 +379,18 @@ async function syncToCnbGit(owner, repo) {
   } catch (e) {
     try { console.log('remote refs error', String(e && e.message ? e.message : e)); } catch (_) {}
   }
-  try { console.log('exec', 'git push --mirror cnb'); } catch (_) {}
-  await runCmd('git', ['push', 'cnb', '--all'], TEMP_DIR);  // 推送所有分支
-  await runCmd('git', ['push', 'cnb', '--tags'], TEMP_DIR); // 推送所有标签
-  try { console.log('done', 'push mirror'); } catch (_) {}
+  try { console.log('exec', 'git push cnb --prune --force --all'); } catch (_) {}
+  await runCmd('git', ['push', 'cnb', '--prune', '--force', '--all'], TEMP_DIR);  // 镜像分支（refs/heads/*）
+  try { console.log('exec', 'git push cnb --force --tags'); } catch (_) {}
+  await runCmd('git', ['push', 'cnb', '--force', '--tags'], TEMP_DIR); // 镜像标签（refs/tags/*）
+  const cnbBranchHashAfter = await readRemoteRefHash(TEMP_DIR, 'cnb', branchRef);
+  if (DEBUG) {
+    try { console.log('debug', 'cnb(after)', branchRef, cnbBranchHashAfter || '(missing)'); } catch (_) {}
+    if (originBranchHash && cnbBranchHashAfter) {
+      try { console.log('debug', 'synced', originBranchHash === cnbBranchHashAfter ? '1' : '0'); } catch (_) {}
+    }
+  }
+  try { console.log('done', 'push branches and tags'); } catch (_) {}
   rimraf(TEMP_DIR);
 }
 
